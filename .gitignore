@@ -1,0 +1,35 @@
+# ===== PlatformIO 构建产物 =====
+.pio/
+.pioenvs/
+.piolibdeps/
+.piopm
+.clang_complete
+.gcc-flags.json
+build/
+
+# ===== 编译/缓存 =====
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.dump
+
+# ===== VSCode 临时（保留 platformio.ini 相关配置） =====
+.vscode/ipch/
+.vscode/*.log
+.vscode/.browse*
+.history/
+
+# ===== 系统/编辑器 =====
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+
+# ===== 旧工程备份 =====
+backup/
