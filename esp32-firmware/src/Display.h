@@ -5,6 +5,7 @@
 #include <lvgl.h>
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 #include "Config.h"
 
 extern "C" const lv_font_t lv_font_chinese_14;
@@ -19,26 +20,58 @@ inline lv_indev_drv_t indevDrv;
 
 inline uint16_t touchCalData[5] = {275, 3620, 264, 3532, 1};
 
+// ===== 全局UI对象 =====
 inline lv_obj_t* root = nullptr;
-inline lv_obj_t* roleLabel = nullptr;
-inline lv_obj_t* binWeightLabel = nullptr;
-inline lv_obj_t* currentWeightLabel = nullptr;
+inline lv_obj_t* binLabel = nullptr;            // 仓号文字 (仓1)
+inline lv_obj_t* connLamp = nullptr;            // 在线/离线 大圆灯
+inline lv_obj_t* statusDots[BIN_COUNT] = {};    // 6仓状态灯 (左到右1-6)
+inline lv_obj_t* binWeightLabel = nullptr;      // 中间130px大数字
+inline lv_obj_t* kgLabel = nullptr;             // kg单位
 inline lv_obj_t* messageLabel = nullptr;
-inline lv_obj_t* statusDots[BIN_COUNT] = {};
 inline lv_obj_t* btnLoad = nullptr;
 inline lv_obj_t* btnUnload = nullptr;
 inline lv_obj_t* btnEdit = nullptr;
 inline lv_obj_t* modal = nullptr;
 
-inline float simBinWeight = 45.0f;
+// ===== 编辑面板对象 =====
+inline lv_obj_t* editOverlay = nullptr;
+inline lv_obj_t* editBinBtns[BIN_COUNT] = {};
+inline int8_t editSelectedBin = 0;
+inline char editInputBuf[16] = "";
+inline lv_obj_t* editInputLabel = nullptr;
+inline lv_obj_t* editKeyMatrix = nullptr;
+
+// ===== 业务状态 (M1模拟) =====
+inline float binWeights[BIN_COUNT] = {45.0f, 30.0f, 50.0f, 20.0f, 60.0f, 35.0f};
+inline uint8_t localBin = 0;           // 本机仓号 0-5 (默认仓1)
 inline float simCurrentWeight = 25.3f;
+inline bool online = false;            // 模拟在线状态 (长按logo切换)
 inline bool persistentError = false;
 inline uint32_t normalMessageUntil = 0;
 inline uint32_t lastSimUpdate = 0;
 
-inline lv_color_t C(uint32_t hex) {
-    return lv_color_hex(hex);
-}
+// 6仓在线表 (M1模拟: 随机几个在线)
+inline bool binOnline[BIN_COUNT] = {true, false, true, true, false, false};
+
+// ===== 颜色 =====
+inline lv_color_t C(uint32_t hex) { return lv_color_hex(hex); }
+constexpr uint32_t CLR_WHITE = 0xFFFFFF;
+constexpr uint32_t CLR_PANEL = 0xFFFFFF;
+constexpr uint32_t CLR_TEXT = 0x222222;
+constexpr uint32_t CLR_MUTED = 0x888888;
+constexpr uint32_t CLR_GREEN = 0x33CC33;   // 在线绿
+constexpr uint32_t CLR_RED = 0xCC0000;     // 离线红/报错
+constexpr uint32_t CLR_GRAY = 0xCCCCCC;    // 灰灯
+constexpr uint32_t CLR_ROASTEK = 0x661E2B; // 玫瑰红(按钮)
+constexpr uint32_t CLR_BG_INPUT = 0xF3F3F3;
+
+// 数字键盘map 4x3: 7 8 9 / 4 5 6 / 1 2 3 / . 0 ⌫
+static const char* kbMap[] = {
+    "7", "8", "9", "\n",
+    "4", "5", "6", "\n",
+    "1", "2", "3", "\n",
+    ".", "0", LV_SYMBOL_BACKSPACE, ""
+};
 
 inline lv_obj_t* makeLabel(lv_obj_t* parent, const char* text, const lv_font_t* font, lv_color_t color) {
     lv_obj_t* label = lv_label_create(parent);
@@ -50,7 +83,7 @@ inline lv_obj_t* makeLabel(lv_obj_t* parent, const char* text, const lv_font_t* 
 
 inline lv_obj_t* makeButton(lv_obj_t* parent, const char* text) {
     lv_obj_t* btn = lv_btn_create(parent);
-    lv_obj_set_style_bg_color(btn, C(COLOR_ROASTEK), 0);
+    lv_obj_set_style_bg_color(btn, C(CLR_ROASTEK), 0);
     lv_obj_set_style_bg_color(btn, C(0xAAAAAA), LV_STATE_DISABLED);
     lv_obj_set_style_radius(btn, 8, 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
@@ -68,10 +101,17 @@ inline void setButtonsEnabled(bool enabled) {
     }
 }
 
+// ===== 前向声明 =====
+inline void updateConnLamp();
+inline void openEditPanel();
+inline void updateWeights();
+inline void showMessage(const char* text, bool error, bool persistent);
+
+// ===== 消息栏 =====
 inline void showMessage(const char* text, bool error = false, bool persistent = false) {
     if (!messageLabel) return;
     lv_label_set_text(messageLabel, text);
-    lv_obj_set_style_text_color(messageLabel, C(error ? COLOR_ERROR : COLOR_ROASTEK), 0);
+    lv_obj_set_style_text_color(messageLabel, C(error ? CLR_RED : CLR_ROASTEK), 0);
     persistentError = persistent;
     if (persistent) {
         normalMessageUntil = 0;
@@ -84,11 +124,11 @@ inline void showMessage(const char* text, bool error = false, bool persistent = 
 
 inline void clearMessage() {
     if (!messageLabel || persistentError) return;
-    lv_label_set_text(messageLabel, "仓1 待数据");
-    lv_obj_set_style_text_color(messageLabel, C(COLOR_MUTED), 0);
+    lv_label_set_text(messageLabel, "");
     normalMessageUntil = 0;
 }
 
+// ===== 模态关闭 =====
 inline void closeModal() {
     if (!modal) return;
     lv_obj_del(modal);
@@ -112,15 +152,15 @@ inline void showInfoDialog(const char* title, const char* body) {
     lv_obj_set_size(box, 330, 178);
     lv_obj_center(box);
     lv_obj_set_style_radius(box, 12, 0);
-    lv_obj_set_style_bg_color(box, C(COLOR_PANEL), 0);
+    lv_obj_set_style_bg_color(box, C(CLR_PANEL), 0);
     lv_obj_set_style_border_width(box, 3, 0);
-    lv_obj_set_style_border_color(box, C(COLOR_ROASTEK), 0);
+    lv_obj_set_style_border_color(box, C(CLR_ROASTEK), 0);
     lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t* titleLabel = makeLabel(box, title, &lv_font_chinese_14, C(COLOR_ROASTEK));
+    lv_obj_t* titleLabel = makeLabel(box, title, &lv_font_chinese_14, C(CLR_ROASTEK));
     lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, 16);
 
-    lv_obj_t* bodyLabel = makeLabel(box, body, &lv_font_chinese_14, C(COLOR_TEXT));
+    lv_obj_t* bodyLabel = makeLabel(box, body, &lv_font_chinese_14, C(CLR_TEXT));
     lv_obj_set_width(bodyLabel, 280);
     lv_label_set_long_mode(bodyLabel, LV_LABEL_LONG_WRAP);
     lv_obj_align(bodyLabel, LV_ALIGN_CENTER, 0, -8);
@@ -131,22 +171,24 @@ inline void showInfoDialog(const char* title, const char* body) {
     lv_obj_add_event_cb(ok, modalCloseEvent, LV_EVENT_CLICKED, nullptr);
 }
 
+// ===== 上料/下料确认弹窗 =====
 inline void confirmEvent(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     const char* op = static_cast<const char*>(lv_event_get_user_data(e));
+    uint8_t b = localBin;
     if (op && strcmp(op, "load") == 0) {
-        simBinWeight += simCurrentWeight;
-        Serial.printf("[EVENT] 上料确认: 仓重 %.1f += %.1f => %.1f\n",
-                      simBinWeight - simCurrentWeight, simCurrentWeight, simBinWeight);
+        binWeights[b] += simCurrentWeight;
+        Serial.printf("[EVENT] 上料确认: 仓%d %.1f += %.1f => %.1f\n",
+                      b + 1, binWeights[b] - simCurrentWeight, simCurrentWeight, binWeights[b]);
         showMessage("上料完毕", false, false);
     } else if (op && strcmp(op, "unload") == 0) {
-        if (simBinWeight < simCurrentWeight) {
-            Serial.printf("[EVENT] 下料失败: 仓重 %.1f < 当前 %.1f\n", simBinWeight, simCurrentWeight);
-            showMessage("下料失败：仓重不足", true, false);
+        if (binWeights[b] < simCurrentWeight) {
+            Serial.printf("[EVENT] 下料失败: 仓%d %.1f < 当前 %.1f\n", b + 1, binWeights[b], simCurrentWeight);
+            showMessage("下料失败:仓重不足", true, false);
         } else {
-            Serial.printf("[EVENT] 下料确认: 仓重 %.1f -= %.1f => %.1f\n",
-                          simBinWeight + simCurrentWeight, simCurrentWeight, simBinWeight);
-            simBinWeight -= simCurrentWeight;
+            Serial.printf("[EVENT] 下料确认: 仓%d %.1f -= %.1f => %.1f\n",
+                          b + 1, binWeights[b] + simCurrentWeight, simCurrentWeight, binWeights[b]);
+            binWeights[b] -= simCurrentWeight;
             showMessage("下料完毕", false, false);
         }
     }
@@ -166,14 +208,14 @@ inline void showConfirmDialog(const char* title, const char* op) {
     lv_obj_set_size(box, 300, 176);
     lv_obj_center(box);
     lv_obj_set_style_radius(box, 12, 0);
-    lv_obj_set_style_bg_color(box, C(COLOR_PANEL), 0);
+    lv_obj_set_style_bg_color(box, C(CLR_PANEL), 0);
     lv_obj_set_style_border_width(box, 3, 0);
-    lv_obj_set_style_border_color(box, C(COLOR_ROASTEK), 0);
+    lv_obj_set_style_border_color(box, C(CLR_ROASTEK), 0);
     lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
 
     char line[64];
-    snprintf(line, sizeof(line), "%s 仓1 %.1fkg", title, simCurrentWeight);
-    lv_obj_t* label = makeLabel(box, line, &lv_font_chinese_14, C(COLOR_TEXT));
+    snprintf(line, sizeof(line), "%s 仓%d %.1fkg", title, localBin + 1, simCurrentWeight);
+    lv_obj_t* label = makeLabel(box, line, &lv_font_chinese_14, C(CLR_TEXT));
     lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 28);
 
     lv_obj_t* cancel = makeButton(box, "取消");
@@ -187,6 +229,232 @@ inline void showConfirmDialog(const char* title, const char* op) {
     lv_obj_add_event_cb(ok, confirmEvent, LV_EVENT_CLICKED, const_cast<char*>(op));
 }
 
+// ===== 编辑面板 (数字键盘) =====
+inline void closeEditPanel() {
+    if (!editOverlay) return;
+    lv_obj_del(editOverlay);
+    editOverlay = nullptr;
+    editInputLabel = nullptr;
+    editKeyMatrix = nullptr;
+    for (int i = 0; i < BIN_COUNT; i++) editBinBtns[i] = nullptr;
+}
+
+inline void updateEditInputDisplay() {
+    if (!editInputLabel) return;
+    char display[24];
+    snprintf(display, sizeof(display), "%s kg", strlen(editInputBuf) == 0 ? "0" : editInputBuf);
+    lv_label_set_text(editInputLabel, display);
+}
+
+inline void updateEditBinHighlight() {
+    for (int i = 0; i < BIN_COUNT; i++) {
+        if (!editBinBtns[i]) continue;
+        bool sel = (i == editSelectedBin);
+        lv_obj_set_style_bg_color(editBinBtns[i], sel ? C(CLR_ROASTEK) : C(CLR_PANEL), 0);
+        lv_obj_set_style_border_width(editBinBtns[i], sel ? 2 : 1, 0);
+        lv_obj_set_style_border_color(editBinBtns[i], sel ? C(CLR_ROASTEK) : C(CLR_GRAY), 0);
+    }
+}
+
+inline void loadBinWeightToEditInput(int8_t bin) {
+    if (bin < 0 || bin >= BIN_COUNT) return;
+    snprintf(editInputBuf, sizeof(editInputBuf), "%.1f", binWeights[bin]);
+    updateEditInputDisplay();
+}
+
+inline void editKeyEvent(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    uint16_t btn = lv_btnmatrix_get_selected_btn(editKeyMatrix);
+    if (btn == LV_BTNMATRIX_BTN_NONE) return;
+    const char* txt = lv_btnmatrix_get_btn_text(editKeyMatrix, btn);
+    if (!txt) return;
+    if (strcmp(txt, LV_SYMBOL_BACKSPACE) == 0) {
+        int len = strlen(editInputBuf);
+        if (len > 0) editInputBuf[len - 1] = '\0';
+    } else if (strcmp(txt, ".") == 0) {
+        if (strchr(editInputBuf, '.') == nullptr) {
+            int len = strlen(editInputBuf);
+            if (len < (int)sizeof(editInputBuf) - 1) {
+                editInputBuf[len] = '.';
+                editInputBuf[len + 1] = '\0';
+            }
+        }
+    } else {
+        int len = strlen(editInputBuf);
+        const char* dotPos = strchr(editInputBuf, '.');
+        if (dotPos != nullptr) {
+            int decimals = len - (dotPos - editInputBuf) - 1;
+            if (decimals >= 1) return;
+        }
+        if (len >= 6) return;
+        editInputBuf[len] = txt[0];
+        editInputBuf[len + 1] = '\0';
+    }
+    updateEditInputDisplay();
+}
+
+inline void editBinSelectEvent(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    editSelectedBin = idx;
+    updateEditBinHighlight();
+    loadBinWeightToEditInput(idx);
+    Serial.printf("[EVENT] 编辑面板: 选择仓%d\n", idx + 1);
+}
+
+inline void editConfirmEvent(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (strlen(editInputBuf) == 0) {
+        showMessage("请输入重量", true, false);
+        return;
+    }
+    float val = atof(editInputBuf);
+    int8_t bin = editSelectedBin;
+    Serial.printf("[EVENT] 编辑确认: 仓%d 设为 %.1f kg\n", bin + 1, val);
+    binWeights[bin] = val;
+    closeEditPanel();
+    if (bin == localBin) updateWeights();
+    showMessage("修改完毕", false, false);
+}
+
+inline void openEditPanel() {
+    if (editOverlay) return;
+    editSelectedBin = localBin;
+    memset(editInputBuf, 0, sizeof(editInputBuf));
+
+    editOverlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(editOverlay);
+    lv_obj_set_size(editOverlay, SCREEN_WIDTH, SCREEN_HEIGHT);
+    lv_obj_set_style_bg_color(editOverlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(editOverlay, LV_OPA_50, 0);
+    lv_obj_set_pos(editOverlay, 0, 0);
+    lv_obj_add_flag(editOverlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(editOverlay, [](lv_event_t* e) {
+        if (lv_event_get_code(e) == LV_EVENT_CLICKED) closeEditPanel();
+    }, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t* panel = lv_obj_create(editOverlay);
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_size(panel, 460, 280);
+    lv_obj_set_style_bg_color(panel, C(CLR_PANEL), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(panel, C(CLR_ROASTEK), 0);
+    lv_obj_set_style_border_width(panel, 2, 0);
+    lv_obj_set_style_radius(panel, 10, 0);
+    lv_obj_set_style_pad_all(panel, 6, 0);
+    lv_obj_center(panel);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 标题
+    lv_obj_t* titleLabel = makeLabel(panel, "编辑仓重量", &lv_font_chinese_14, C(CLR_TEXT));
+    lv_obj_align(titleLabel, LV_ALIGN_TOP_LEFT, 4, 2);
+
+    // 关闭按钮
+    lv_obj_t* closeBtn = lv_btn_create(panel);
+    lv_obj_set_size(closeBtn, 32, 32);
+    lv_obj_set_style_radius(closeBtn, 16, 0);
+    lv_obj_set_style_bg_color(closeBtn, C(CLR_ROASTEK), 0);
+    lv_obj_set_style_border_width(closeBtn, 0, 0);
+    lv_obj_set_style_shadow_width(closeBtn, 0, 0);
+    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_t* xLabel = lv_label_create(closeBtn);
+    lv_label_set_text(xLabel, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_color(xLabel, lv_color_white(), 0);
+    lv_obj_center(xLabel);
+    lv_obj_add_event_cb(closeBtn, [](lv_event_t* e) {
+        closeEditPanel();
+    }, LV_EVENT_CLICKED, nullptr);
+
+    // 内容区: 左仓选择 + 右键盘
+    lv_obj_t* content = lv_obj_create(panel);
+    lv_obj_remove_style_all(content);
+    lv_obj_set_size(content, 440, 244);
+    lv_obj_set_style_pad_all(content, 4, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_ROW);
+    lv_obj_align(content, LV_ALIGN_TOP_LEFT, 0, 24);
+
+    // 左: 仓1-6
+    lv_obj_t* leftCol = lv_obj_create(content);
+    lv_obj_remove_style_all(leftCol);
+    lv_obj_set_size(leftCol, 72, 236);
+    lv_obj_set_style_pad_all(leftCol, 2, 0);
+    lv_obj_set_style_pad_row(leftCol, 2, 0);
+    lv_obj_set_flex_flow(leftCol, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(leftCol, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    for (int i = 0; i < BIN_COUNT; i++) {
+        editBinBtns[i] = lv_btn_create(leftCol);
+        lv_obj_set_size(editBinBtns[i], 64, 34);
+        lv_obj_set_style_radius(editBinBtns[i], 6, 0);
+        lv_obj_set_style_bg_color(editBinBtns[i], C(CLR_PANEL), 0);
+        lv_obj_set_style_bg_opa(editBinBtns[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(editBinBtns[i], 1, 0);
+        lv_obj_set_style_border_color(editBinBtns[i], C(CLR_GRAY), 0);
+        lv_obj_set_style_shadow_width(editBinBtns[i], 0, 0);
+        lv_obj_add_event_cb(editBinBtns[i], editBinSelectEvent, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        char bn[8];
+        snprintf(bn, sizeof(bn), "仓%d", i + 1);
+        lv_obj_t* bLbl = makeLabel(editBinBtns[i], bn, &lv_font_chinese_14, C(CLR_TEXT));
+        lv_obj_center(bLbl);
+    }
+
+    // 右: 输入框 + 键盘 + 确认
+    lv_obj_t* rightCol = lv_obj_create(content);
+    lv_obj_remove_style_all(rightCol);
+    lv_obj_set_size(rightCol, 356, 236);
+    lv_obj_set_style_pad_all(rightCol, 4, 0);
+    lv_obj_set_style_pad_row(rightCol, 4, 0);
+    lv_obj_set_flex_flow(rightCol, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(rightCol, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t* inputBox = lv_obj_create(rightCol);
+    lv_obj_remove_style_all(inputBox);
+    lv_obj_set_size(inputBox, 340, 36);
+    lv_obj_set_style_bg_color(inputBox, C(CLR_BG_INPUT), 0);
+    lv_obj_set_style_bg_opa(inputBox, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(inputBox, 6, 0);
+    lv_obj_set_style_border_color(inputBox, C(CLR_ROASTEK), 0);
+    lv_obj_set_style_border_width(inputBox, 1, 0);
+
+    editInputLabel = makeLabel(inputBox, "0 kg", &lv_font_chinese_14, C(CLR_TEXT));
+    lv_obj_align(editInputLabel, LV_ALIGN_RIGHT_MID, -8, 0);
+
+    editKeyMatrix = lv_btnmatrix_create(rightCol);
+    lv_obj_set_size(editKeyMatrix, 340, 120);
+    lv_btnmatrix_set_map(editKeyMatrix, kbMap);
+    lv_obj_set_style_bg_color(editKeyMatrix, C(CLR_PANEL), 0);
+    lv_obj_set_style_bg_opa(editKeyMatrix, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(editKeyMatrix, 0, 0);
+    lv_obj_set_style_radius(editKeyMatrix, 6, 0);
+    lv_obj_set_style_pad_all(editKeyMatrix, 2, 0);
+    lv_obj_set_style_pad_gap(editKeyMatrix, 4, 0);
+    lv_obj_set_style_bg_color(editKeyMatrix, C(CLR_BG_INPUT), LV_PART_ITEMS);
+    lv_obj_set_style_bg_opa(editKeyMatrix, LV_OPA_COVER, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(editKeyMatrix, C(CLR_TEXT), LV_PART_ITEMS);
+    lv_obj_set_style_text_font(editKeyMatrix, &lv_font_chinese_14, LV_PART_ITEMS);
+    lv_obj_set_style_radius(editKeyMatrix, 6, LV_PART_ITEMS);
+    lv_obj_set_style_border_width(editKeyMatrix, 0, LV_PART_ITEMS);
+    lv_obj_set_style_shadow_width(editKeyMatrix, 0, LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(editKeyMatrix, C(CLR_ROASTEK), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(editKeyMatrix, lv_color_white(), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_add_event_cb(editKeyMatrix, editKeyEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    lv_obj_t* editConfirmBtn = lv_btn_create(rightCol);
+    lv_obj_set_size(editConfirmBtn, 340, 36);
+    lv_obj_set_style_radius(editConfirmBtn, 6, 0);
+    lv_obj_set_style_bg_color(editConfirmBtn, C(CLR_ROASTEK), 0);
+    lv_obj_set_style_bg_opa(editConfirmBtn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(editConfirmBtn, 0, 0);
+    lv_obj_set_style_shadow_width(editConfirmBtn, 0, 0);
+    lv_obj_t* ecLbl = makeLabel(editConfirmBtn, "确认", &lv_font_chinese_14, lv_color_white());
+    lv_obj_center(ecLbl);
+    lv_obj_add_event_cb(editConfirmBtn, editConfirmEvent, LV_EVENT_CLICKED, nullptr);
+
+    updateEditBinHighlight();
+    loadBinWeightToEditInput(editSelectedBin);
+    Serial.println("[EVENT] 编辑面板已打开");
+}
+
 inline void buttonEvent(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     const char* action = static_cast<const char*>(lv_event_get_user_data(e));
@@ -194,41 +462,26 @@ inline void buttonEvent(lv_event_t* e) {
     Serial.printf("[EVENT] 按钮点击: %s\n", action);
     if (strcmp(action, "load") == 0) showConfirmDialog("上料", "load");
     else if (strcmp(action, "unload") == 0) showConfirmDialog("下料", "unload");
-    else if (strcmp(action, "edit") == 0) showInfoDialog("编辑", "M1 仓编辑 后续实现");
+    else if (strcmp(action, "edit") == 0) openEditPanel();
 }
 
+// ===== 长按logo: 切换在线/离线 (M1模拟) =====
 inline void logoEvent(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
-    if (persistentError) {
-        persistentError = false;
-        setButtonsEnabled(true);
-        Serial.println("[EVENT] 长按logo: 恢复通信");
+    online = !online;
+    if (online) {
+        Serial.println("[EVENT] 长按logo: 切换在线");
         showMessage("仓1 在线", false, false);
     } else {
-        Serial.println("[EVENT] 长按logo: 触发通信中断(常驻报错)");
+        Serial.println("[EVENT] 长按logo: 切换离线");
         showMessage("仓1 离线", true, true);
     }
+    updateConnLamp();
 }
 
+// ===== 触摸 =====
 inline uint16_t flipTouchAxis(uint16_t value, int maxValue) {
     return value >= maxValue ? 0 : static_cast<uint16_t>(maxValue - 1 - value);
-}
-
-inline uint32_t flushCount = 0;
-inline uint32_t flushPixels = 0;
-inline uint32_t lastFlushReportMs = 0;
-
-inline void displayFlush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
-    uint32_t w = area->x2 - area->x1 + 1;
-    uint32_t h = area->y2 - area->y1 + 1;
-    tft.startWrite();
-    tft.setAddrWindow(area->x1, area->y1, w, h);
-    tft.pushColors(reinterpret_cast<uint16_t*>(&color_p->full), w * h, true);
-    tft.endWrite();
-    // 渲染管线计数: 证明 LVGL 正在持续向 TFT 推送像素(即屏幕在被刷新)
-    flushCount++;
-    flushPixels += w * h;
-    lv_disp_flush_ready(disp);
 }
 
 inline uint32_t lastTouchLogMs = 0;
@@ -241,7 +494,6 @@ inline void touchRead(lv_indev_drv_t* indev, lv_indev_data_t* data) {
         data->state = LV_INDEV_STATE_PR;
         data->point.x = flipTouchAxis(tx, tft.width());
         data->point.y = flipTouchAxis(ty, tft.height());
-        // 串口触摸诊断:按下瞬间(去抖)打印原始+翻转后坐标
         if (!lastTouchState || (millis() - lastTouchLogMs > 300)) {
             Serial.printf("[Touch] raw=(%u,%u) flip=(%d,%d)\n",
                           tx, ty, data->point.x, data->point.y);
@@ -254,97 +506,178 @@ inline void touchRead(lv_indev_drv_t* indev, lv_indev_data_t* data) {
     }
 }
 
-inline void updateWeights() {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.1f", simBinWeight);
-    lv_label_set_text(binWeightLabel, buf);
-
-    snprintf(buf, sizeof(buf), "当前称重  %.1f kg", simCurrentWeight);
-    lv_label_set_text(currentWeightLabel, buf);
+// ===== 渲染flush =====
+inline void displayFlush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
+    uint32_t w = area->x2 - area->x1 + 1;
+    uint32_t h = area->y2 - area->y1 + 1;
+    tft.startWrite();
+    tft.setAddrWindow(area->x1, area->y1, w, h);
+    tft.pushColors(reinterpret_cast<uint16_t*>(&color_p->full), w * h, true);
+    tft.endWrite();
+    lv_disp_flush_ready(disp);
 }
 
+// ===== 更新重量显示 =====
+inline void updateWeights() {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.1f", binWeights[localBin]);
+    lv_label_set_text(binWeightLabel, buf);
+}
+
+// ===== 更新在线/离线灯 =====
+inline void updateConnLamp() {
+    if (!connLamp) return;
+    if (online) {
+        lv_obj_set_style_bg_color(connLamp, C(CLR_GREEN), 0);
+        lv_obj_set_style_border_color(connLamp, C(CLR_GREEN), 0);
+    } else {
+        lv_obj_set_style_bg_color(connLamp, C(CLR_RED), 0);
+        lv_obj_set_style_border_color(connLamp, C(CLR_RED), 0);
+    }
+}
+
+// ===== 更新6仓状态灯 =====
+inline void updateBinDots() {
+    for (uint8_t i = 0; i < BIN_COUNT; ++i) {
+        if (!statusDots[i]) continue;
+        // 在线=绿色, 离线=灰色; 本机仓高亮加玫瑰红边框
+        lv_obj_set_style_bg_color(statusDots[i], C(binOnline[i] ? CLR_GREEN : CLR_GRAY), 0);
+        if (i == localBin) {
+            lv_obj_set_style_border_color(statusDots[i], C(CLR_ROASTEK), 0);
+            lv_obj_set_style_border_width(statusDots[i], 3, 0);
+        } else {
+            lv_obj_set_style_border_width(statusDots[i], 0, 0);
+        }
+    }
+}
+
+// ===== 构建主页 =====
 inline void buildHome() {
     root = lv_scr_act();
-    lv_obj_set_style_bg_color(root, C(COLOR_BG), 0);
+    lv_obj_set_style_bg_color(root, C(CLR_WHITE), 0);   // 背景全白
     lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
+    // --- 顶栏 (高60) ---
     lv_obj_t* top = lv_obj_create(root);
     lv_obj_remove_style_all(top);
-    lv_obj_set_size(top, SCREEN_WIDTH, 56);
+    lv_obj_set_size(top, SCREEN_WIDTH, 60);
     lv_obj_align(top, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(top, C(COLOR_PANEL), 0);
+    lv_obj_set_style_bg_color(top, C(CLR_WHITE), 0);    // 顶栏白
     lv_obj_set_style_bg_opa(top, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(top, 0, 0);
     lv_obj_clear_flag(top, LV_OBJ_FLAG_SCROLLABLE);
 
+    // logo (左, 原始尺寸96x53)
     lv_obj_t* logo = lv_img_create(top);
     lv_img_set_src(logo, &logo_roastek);
-    // logo 原始 96x53,保持不缩放;竖直居中在56px顶栏
-    lv_obj_align(logo, LV_ALIGN_LEFT_MID, 6, 0);
+    lv_obj_align(logo, LV_ALIGN_LEFT_MID, 4, 0);
     lv_obj_add_flag(logo, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(logo, logoEvent, LV_EVENT_LONG_PRESSED, nullptr);
 
-    // 仓1文字右移让位给logo(logo占x=6..102,文字从x=112开始)
-    roleLabel = makeLabel(top, "仓1 | 主机", &lv_font_chinese_14, C(COLOR_TEXT));
-    lv_obj_align(roleLabel, LV_ALIGN_LEFT_MID, 112, 0);
+    // 仓号文字 (logo右侧)
+    char binTitle[8];
+    snprintf(binTitle, sizeof(binTitle), "仓%d", localBin + 1);
+    binLabel = makeLabel(top, binTitle, &lv_font_chinese_14, C(CLR_TEXT));
+    lv_obj_align(binLabel, LV_ALIGN_LEFT_MID, 108, 0);
 
+    // 在线/离线 大圆灯 (仓号右侧)
+    connLamp = lv_obj_create(top);
+    lv_obj_remove_style_all(connLamp);
+    lv_obj_set_size(connLamp, 26, 26);
+    lv_obj_align(connLamp, LV_ALIGN_LEFT_MID, 148, 0);
+    lv_obj_set_style_radius(connLamp, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(connLamp, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(connLamp, 2, 0);
+    updateConnLamp();
+
+    // 6仓状态灯 (居中偏右, 左到右1-6)
     lv_obj_t* dots = lv_obj_create(top);
     lv_obj_remove_style_all(dots);
-    lv_obj_set_size(dots, 108, 20);
-    lv_obj_align(dots, LV_ALIGN_CENTER, 74, 0);
+    lv_obj_set_size(dots, 168, 26);
+    lv_obj_align(dots, LV_ALIGN_LEFT_MID, 188, 0);
+    lv_obj_set_style_bg_opa(dots, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(dots, 0, 0);
     lv_obj_set_flex_flow(dots, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(dots, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     for (uint8_t i = 0; i < BIN_COUNT; ++i) {
         statusDots[i] = lv_obj_create(dots);
         lv_obj_remove_style_all(statusDots[i]);
-        lv_obj_set_size(statusDots[i], 12, 12);
+        lv_obj_set_size(statusDots[i], 18, 18);
         lv_obj_set_style_radius(statusDots[i], LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(statusDots[i], C(i == 0 ? COLOR_ROASTEK : COLOR_MUTED), 0);
         lv_obj_set_style_bg_opa(statusDots[i], LV_OPA_COVER, 0);
     }
+    updateBinDots();
 
+    // 编辑按钮 (右上)
     btnEdit = makeButton(top, "编辑");
     lv_obj_set_size(btnEdit, 64, 36);
     lv_obj_align(btnEdit, LV_ALIGN_RIGHT_MID, -8, 0);
     lv_obj_add_event_cb(btnEdit, buttonEvent, LV_EVENT_CLICKED, const_cast<char*>("edit"));
 
+    // --- 中间区 (130px大数字 + kg) ---
     lv_obj_t* middle = lv_obj_create(root);
     lv_obj_remove_style_all(middle);
-    lv_obj_set_size(middle, SCREEN_WIDTH, 194);
-    lv_obj_align(middle, LV_ALIGN_TOP_MID, 0, 56);
-    lv_obj_set_style_bg_color(middle, C(COLOR_BG), 0);
+    lv_obj_set_size(middle, SCREEN_WIDTH, 190);
+    lv_obj_align(middle, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_set_style_bg_color(middle, C(CLR_WHITE), 0);  // 中间白
     lv_obj_set_style_bg_opa(middle, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(middle, LV_OBJ_FLAG_SCROLLABLE);
 
-    binWeightLabel = makeLabel(middle, "--", &lv_font_numbers_130, C(COLOR_TEXT));
-    lv_obj_align(binWeightLabel, LV_ALIGN_CENTER, -40, 0);
+    binWeightLabel = makeLabel(middle, "--", &lv_font_numbers_130, C(CLR_TEXT));
+    lv_obj_align(binWeightLabel, LV_ALIGN_LEFT_MID, 40, 0);
 
-    lv_obj_t* kg = makeLabel(middle, "kg", &lv_font_montserrat_48, C(COLOR_TEXT));
-    // kg 紧贴大数字右下,垂直往下偏移避免被 130px 字体高行高覆盖
-    lv_obj_align_to(kg, binWeightLabel, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -8);
+    kgLabel = makeLabel(middle, "kg", &lv_font_montserrat_48, C(CLR_TEXT));
+    // kg放在大数字右下, 用绝对坐标避免bbox穿模
+    lv_obj_align(kgLabel, LV_ALIGN_LEFT_MID, 40 + 260, 28);
 
+    // --- 底部 (沿用老版本: 消息区在上 + 上料/下料两个大按钮在下) ---
     lv_obj_t* bottom = lv_obj_create(root);
     lv_obj_remove_style_all(bottom);
     lv_obj_set_size(bottom, SCREEN_WIDTH, 70);
     lv_obj_align(bottom, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(bottom, C(COLOR_PANEL), 0);
+    lv_obj_set_style_bg_color(bottom, C(CLR_WHITE), 0);  // 底部白
     lv_obj_set_style_bg_opa(bottom, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(bottom, 4, 0);
+    lv_obj_set_flex_flow(bottom, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(bottom, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(bottom, LV_OBJ_FLAG_SCROLLABLE);
 
-    currentWeightLabel = makeLabel(bottom, "当前称重  -- kg", &lv_font_chinese_14, C(COLOR_TEXT));
-    lv_obj_align(currentWeightLabel, LV_ALIGN_TOP_MID, 0, 8);
+    // 消息区 (居中, 宽470)
+    messageLabel = lv_label_create(bottom);
+    lv_label_set_text(messageLabel, "");
+    lv_obj_set_style_text_font(messageLabel, &lv_font_chinese_14, 0);
+    lv_obj_set_style_text_color(messageLabel, C(CLR_TEXT), 0);
+    lv_obj_set_style_text_align(messageLabel, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_size(messageLabel, SCREEN_WIDTH - 10, 22);
 
-    btnLoad = makeButton(bottom, "上料完毕");
-    lv_obj_set_size(btnLoad, 112, 38);
-    lv_obj_align(btnLoad, LV_ALIGN_LEFT_MID, 18, 10);
+    // 按钮区 (上料/下料两个大按钮并排)
+    lv_obj_t* btnRow = lv_obj_create(bottom);
+    lv_obj_remove_style_all(btnRow);
+    lv_obj_set_size(btnRow, SCREEN_WIDTH - 8, 44);
+    lv_obj_set_flex_flow(btnRow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btnRow, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    btnLoad = lv_btn_create(btnRow);
+    lv_obj_set_size(btnLoad, 230, 44);
+    lv_obj_set_style_radius(btnLoad, 6, 0);
+    lv_obj_set_style_bg_color(btnLoad, C(CLR_ROASTEK), 0);
+    lv_obj_set_style_bg_opa(btnLoad, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(btnLoad, 0, 0);
+    lv_obj_set_style_shadow_width(btnLoad, 0, 0);
     lv_obj_add_event_cb(btnLoad, buttonEvent, LV_EVENT_CLICKED, const_cast<char*>("load"));
+    lv_obj_t* feedLbl = makeLabel(btnLoad, "上料完毕", &lv_font_chinese_14, lv_color_white());
+    lv_obj_center(feedLbl);
 
-    btnUnload = makeButton(bottom, "下料完毕");
-    lv_obj_set_size(btnUnload, 112, 38);
-    lv_obj_align(btnUnload, LV_ALIGN_RIGHT_MID, -18, 10);
+    btnUnload = lv_btn_create(btnRow);
+    lv_obj_set_size(btnUnload, 230, 44);
+    lv_obj_set_style_radius(btnUnload, 6, 0);
+    lv_obj_set_style_bg_color(btnUnload, C(CLR_ROASTEK), 0);
+    lv_obj_set_style_bg_opa(btnUnload, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(btnUnload, 0, 0);
+    lv_obj_set_style_shadow_width(btnUnload, 0, 0);
     lv_obj_add_event_cb(btnUnload, buttonEvent, LV_EVENT_CLICKED, const_cast<char*>("unload"));
-
-    messageLabel = makeLabel(bottom, "仓1 待数据", &lv_font_chinese_14, C(COLOR_MUTED));
-    lv_obj_align(messageLabel, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_t* dischLbl = makeLabel(btnUnload, "下料完毕", &lv_font_chinese_14, lv_color_white());
+    lv_obj_center(dischLbl);
 
     updateWeights();
 }
@@ -392,45 +725,39 @@ inline void Display_Loop() {
     }
 }
 
-// ============== 启动自测:程序化驱动业务逻辑,验证交互链路(不依赖人手触摸) ==============
-// 直接调用与触摸按钮相同的事件处理路径,断言仓重计算正确。
+// ===== 启动自测 =====
 inline void Display_SelfTest() {
     Serial.println("[SELFTEST] === 开始 ===");
     bool allPass = true;
 
-    // 固定一个可预测的当前称重,避免正弦波动干扰断言
     simCurrentWeight = 10.0f;
-    simBinWeight = 50.0f;
-    Serial.printf("[SELFTEST] 初始: 仓重=%.1f 当前=%.1f\n", simBinWeight, simCurrentWeight);
+    binWeights[0] = 50.0f;
+    Serial.printf("[SELFTEST] 初始: 仓重=%.1f 当前=%.1f\n", binWeights[0], simCurrentWeight);
 
-    // 1. 上料: 仓重 += 当前  => 60
-    float before = simBinWeight;
-    simBinWeight += simCurrentWeight;  // 与 confirmEvent "load" 路径相同
-    bool t1 = (simBinWeight == 60.0f);
+    float before = binWeights[0];
+    binWeights[0] += simCurrentWeight;
+    bool t1 = (binWeights[0] == 60.0f);
     Serial.printf("[SELFTEST] 上料: %.1f += %.1f => %.1f  %s\n",
-                  before, simCurrentWeight, simBinWeight, t1 ? "PASS" : "FAIL");
+                  before, simCurrentWeight, binWeights[0], t1 ? "PASS" : "FAIL");
     allPass &= t1;
 
-    // 2. 下料: 仓重 -= 当前  => 50
-    before = simBinWeight;
-    bool canUnload = simBinWeight >= simCurrentWeight;  // 与 confirmEvent "unload" 路径相同
-    if (canUnload) simBinWeight -= simCurrentWeight;
-    bool t2 = (simBinWeight == 50.0f) && canUnload;
+    before = binWeights[0];
+    bool canUnload = binWeights[0] >= simCurrentWeight;
+    if (canUnload) binWeights[0] -= simCurrentWeight;
+    bool t2 = (binWeights[0] == 50.0f) && canUnload;
     Serial.printf("[SELFTEST] 下料: %.1f -= %.1f => %.1f  %s\n",
-                  before, simCurrentWeight, simBinWeight, t2 ? "PASS" : "FAIL");
+                  before, simCurrentWeight, binWeights[0], t2 ? "PASS" : "FAIL");
     allPass &= t2;
 
-    // 3. 下料不足保护: 把仓重设为 < 当前,应拒绝下料
-    simBinWeight = 3.0f;
-    before = simBinWeight;
-    canUnload = simBinWeight >= simCurrentWeight;  // 3 < 10 => false
-    if (canUnload) simBinWeight -= simCurrentWeight;
-    bool t3 = (!canUnload) && (simBinWeight == 3.0f);  // 仓重未被扣减
+    binWeights[0] = 3.0f;
+    before = binWeights[0];
+    canUnload = binWeights[0] >= simCurrentWeight;
+    if (canUnload) binWeights[0] -= simCurrentWeight;
+    bool t3 = (!canUnload) && (binWeights[0] == 3.0f);
     Serial.printf("[SELFTEST] 下料不足保护: 仓重 %.1f < 当前 %.1f, 拒绝, 仓重仍 %.1f  %s\n",
-                  before, simCurrentWeight, simBinWeight, t3 ? "PASS" : "FAIL");
+                  before, simCurrentWeight, binWeights[0], t3 ? "PASS" : "FAIL");
     allPass &= t3;
 
-    // 4. 报错常驻 -> 恢复 切换(与 logoEvent 路径相同)
     persistentError = true;
     setButtonsEnabled(false);
     bool buttonsDisabledWhenError = (lv_obj_get_state(btnLoad) & LV_STATE_DISABLED);
@@ -442,11 +769,9 @@ inline void Display_SelfTest() {
                   buttonsDisabledWhenError, buttonsEnabledAfterRecover, t4 ? "PASS" : "FAIL");
     allPass &= t4;
 
-    // 恢复展示用的初始值
-    simBinWeight = 45.0f;
+    binWeights[0] = 45.0f;
     updateWeights();
-    showMessage("仓1 待数据", false, false);
+    showMessage("仓1 在线", false, false);
 
     Serial.printf("[SELFTEST] === %s ===\n", allPass ? "ALL PASS" : "SOME FAILED");
-    Serial.println("[SELFTEST] 现在可手动触摸屏幕,串口会打印 [Touch]/[EVENT]");
 }
