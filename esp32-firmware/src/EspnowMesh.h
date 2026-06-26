@@ -100,6 +100,15 @@ inline void onEspNowRecv(const uint8_t* mac_addr, const uint8_t* data, int len) 
     if (memcmp(pkt.mac, myMac, 6) == 0) return;
 
     uint8_t idx = pkt.binId - 1;  // 0-5
+
+    // 每5秒打印一次心跳摘要(避免刷屏)
+    static uint32_t lastRecvLogMs = 0;
+    if (millis() - lastRecvLogMs > 5000) {
+        lastRecvLogMs = millis();
+        Serial.printf("[ESPNOW] 收: 仓%d MAC %02X:%02X:..seq=%u bw=%.1f cw=%.1f\n",
+                      pkt.binId, pkt.mac[0], pkt.mac[1], pkt.seq, pkt.binWeight, pkt.currentWeight);
+    }
+
     bool wasOnline = binStates[idx].online;
     binStates[idx].online = true;
     binStates[idx].lastHeardMs = millis();
@@ -173,10 +182,16 @@ inline bool EspnowMesh_Init() {
 inline void EspnowMesh_Loop(float myBinWeight, float myCurrentWeight) {
     uint32_t now = millis();
 
-    // 定时广播心跳
+    // 定时广播心跳 + 日志
     if (now - lastHeartbeatSentMs >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatSentMs = now;
         EspnowMesh_BroadcastHeartbeat(myBinWeight, myCurrentWeight);
+        static uint32_t lastSendLogMs = 0;
+        if (now - lastSendLogMs > 5000) {
+            lastSendLogMs = now;
+            Serial.printf("[ESPNOW] 发: 仓%d seq=%u bw=%.1f cw=%.1f\n",
+                          myBinId, hbSeq, myBinWeight, myCurrentWeight);
+        }
     }
 
     // 检测其他仓离线
