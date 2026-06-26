@@ -84,7 +84,7 @@ inline void showMessage(const char* text, bool error = false, bool persistent = 
 
 inline void clearMessage() {
     if (!messageLabel || persistentError) return;
-    lv_label_set_text(messageLabel, "M1模拟：同一固件，可刷COM3/COM4");
+    lv_label_set_text(messageLabel, "仓1 待数据");
     lv_obj_set_style_text_color(messageLabel, C(COLOR_MUTED), 0);
     normalMessageUntil = 0;
 }
@@ -125,7 +125,7 @@ inline void showInfoDialog(const char* title, const char* body) {
     lv_label_set_long_mode(bodyLabel, LV_LABEL_LONG_WRAP);
     lv_obj_align(bodyLabel, LV_ALIGN_CENTER, 0, -8);
 
-    lv_obj_t* ok = makeButton(box, "知道了");
+    lv_obj_t* ok = makeButton(box, "确认");
     lv_obj_set_size(ok, 104, 42);
     lv_obj_align(ok, LV_ALIGN_BOTTOM_MID, 0, -12);
     lv_obj_add_event_cb(ok, modalCloseEvent, LV_EVENT_CLICKED, nullptr);
@@ -138,7 +138,7 @@ inline void confirmEvent(lv_event_t* e) {
         simBinWeight += simCurrentWeight;
         Serial.printf("[EVENT] 上料确认: 仓重 %.1f += %.1f => %.1f\n",
                       simBinWeight - simCurrentWeight, simCurrentWeight, simBinWeight);
-        showMessage("上料完毕：仓1已累加", false, false);
+        showMessage("上料完毕", false, false);
     } else if (op && strcmp(op, "unload") == 0) {
         if (simBinWeight < simCurrentWeight) {
             Serial.printf("[EVENT] 下料失败: 仓重 %.1f < 当前 %.1f\n", simBinWeight, simCurrentWeight);
@@ -147,7 +147,7 @@ inline void confirmEvent(lv_event_t* e) {
             Serial.printf("[EVENT] 下料确认: 仓重 %.1f -= %.1f => %.1f\n",
                           simBinWeight + simCurrentWeight, simCurrentWeight, simBinWeight);
             simBinWeight -= simCurrentWeight;
-            showMessage("下料完毕：仓1已扣减", false, false);
+            showMessage("下料完毕", false, false);
         }
     }
     closeModal();
@@ -194,7 +194,7 @@ inline void buttonEvent(lv_event_t* e) {
     Serial.printf("[EVENT] 按钮点击: %s\n", action);
     if (strcmp(action, "load") == 0) showConfirmDialog("上料", "load");
     else if (strcmp(action, "unload") == 0) showConfirmDialog("下料", "unload");
-    else if (strcmp(action, "edit") == 0) showInfoDialog("编辑仓重", "M1只验证界面和触摸；6仓编辑/NVS放到M2实现。");
+    else if (strcmp(action, "edit") == 0) showInfoDialog("编辑", "M1 仓编辑 后续实现");
 }
 
 inline void logoEvent(lv_event_t* e) {
@@ -203,16 +203,20 @@ inline void logoEvent(lv_event_t* e) {
         persistentError = false;
         setButtonsEnabled(true);
         Serial.println("[EVENT] 长按logo: 恢复通信");
-        showMessage("通信恢复：模拟报错已清除", false, false);
+        showMessage("仓1 在线", false, false);
     } else {
         Serial.println("[EVENT] 长按logo: 触发通信中断(常驻报错)");
-        showMessage("通信中断：模拟报错", true, true);
+        showMessage("仓1 离线", true, true);
     }
 }
 
 inline uint16_t flipTouchAxis(uint16_t value, int maxValue) {
     return value >= maxValue ? 0 : static_cast<uint16_t>(maxValue - 1 - value);
 }
+
+inline uint32_t flushCount = 0;
+inline uint32_t flushPixels = 0;
+inline uint32_t lastFlushReportMs = 0;
 
 inline void displayFlush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
     uint32_t w = area->x2 - area->x1 + 1;
@@ -221,6 +225,9 @@ inline void displayFlush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t*
     tft.setAddrWindow(area->x1, area->y1, w, h);
     tft.pushColors(reinterpret_cast<uint16_t*>(&color_p->full), w * h, true);
     tft.endWrite();
+    // 渲染管线计数: 证明 LVGL 正在持续向 TFT 推送像素(即屏幕在被刷新)
+    flushCount++;
+    flushPixels += w * h;
     lv_disp_flush_ready(disp);
 }
 
@@ -272,13 +279,14 @@ inline void buildHome() {
 
     lv_obj_t* logo = lv_img_create(top);
     lv_img_set_src(logo, &logo_roastek);
-    lv_obj_set_size(logo, 72, 40);
-    lv_obj_align(logo, LV_ALIGN_LEFT_MID, 8, 0);
+    // logo 位图原始 96x53;缩小到约 57x32,放进 56px 高顶栏,避免溢出穿模
+    lv_img_set_zoom(logo, 256 * 57 / 96);
+    lv_obj_align(logo, LV_ALIGN_LEFT_MID, 6, 0);
     lv_obj_add_flag(logo, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(logo, logoEvent, LV_EVENT_LONG_PRESSED, nullptr);
 
-    roleLabel = makeLabel(top, "仓1 | 网关(M1模拟)", &lv_font_chinese_14, C(COLOR_TEXT));
-    lv_obj_align(roleLabel, LV_ALIGN_LEFT_MID, 92, 0);
+    roleLabel = makeLabel(top, "仓1 | 主机", &lv_font_chinese_14, C(COLOR_TEXT));
+    lv_obj_align(roleLabel, LV_ALIGN_LEFT_MID, 72, 0);
 
     lv_obj_t* dots = lv_obj_create(top);
     lv_obj_remove_style_all(dots);
@@ -308,10 +316,11 @@ inline void buildHome() {
     lv_obj_set_style_bg_opa(middle, LV_OPA_COVER, 0);
 
     binWeightLabel = makeLabel(middle, "--", &lv_font_numbers_130, C(COLOR_TEXT));
-    lv_obj_align(binWeightLabel, LV_ALIGN_CENTER, -22, -12);
+    lv_obj_align(binWeightLabel, LV_ALIGN_CENTER, -40, 0);
 
     lv_obj_t* kg = makeLabel(middle, "kg", &lv_font_montserrat_48, C(COLOR_TEXT));
-    lv_obj_align_to(kg, binWeightLabel, LV_ALIGN_OUT_RIGHT_MID, 8, 18);
+    // kg 紧贴大数字右下,垂直往下偏移避免被 130px 字体高行高覆盖
+    lv_obj_align_to(kg, binWeightLabel, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -8);
 
     lv_obj_t* bottom = lv_obj_create(root);
     lv_obj_remove_style_all(bottom);
@@ -334,7 +343,7 @@ inline void buildHome() {
     lv_obj_align(btnUnload, LV_ALIGN_RIGHT_MID, -18, 10);
     lv_obj_add_event_cb(btnUnload, buttonEvent, LV_EVENT_CLICKED, const_cast<char*>("unload"));
 
-    messageLabel = makeLabel(bottom, "M1模拟：同一固件，可刷COM3/COM4", &lv_font_chinese_14, C(COLOR_MUTED));
+    messageLabel = makeLabel(bottom, "仓1 待数据", &lv_font_chinese_14, C(COLOR_MUTED));
     lv_obj_align(messageLabel, LV_ALIGN_BOTTOM_MID, 0, -4);
 
     updateWeights();
@@ -436,7 +445,7 @@ inline void Display_SelfTest() {
     // 恢复展示用的初始值
     simBinWeight = 45.0f;
     updateWeights();
-    showMessage("M1模拟：同一固件，可刷COM3/COM4", false, false);
+    showMessage("仓1 待数据", false, false);
 
     Serial.printf("[SELFTEST] === %s ===\n", allPass ? "ALL PASS" : "SOME FAILED");
     Serial.println("[SELFTEST] 现在可手动触摸屏幕,串口会打印 [Touch]/[EVENT]");
