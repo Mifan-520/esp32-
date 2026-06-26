@@ -25,8 +25,10 @@ inline lv_obj_t* root = nullptr;
 inline lv_obj_t* binLabel = nullptr;            // 仓号文字 (仓1)
 inline lv_obj_t* connLamp = nullptr;            // 在线/离线 大圆灯
 inline lv_obj_t* statusDots[BIN_COUNT] = {};    // 6仓状态灯 (左到右1-6)
-inline lv_obj_t* binWeightLabel = nullptr;      // 中间130px大数字
-inline lv_obj_t* kgLabel = nullptr;             // kg单位
+inline lv_obj_t* binWeightLabel = nullptr;      // 中间130px大数字 (仓重)
+inline lv_obj_t* kgLabel = nullptr;             // 仓重 kg单位(缩小,在数字下方)
+inline lv_obj_t* curWeightLabel = nullptr;      // 左侧称重重量
+inline lv_obj_t* curKgLabel = nullptr;          // 称重 kg单位(缩小,在数字下方)
 inline lv_obj_t* messageLabel = nullptr;
 inline lv_obj_t* btnLoad = nullptr;
 inline lv_obj_t* btnUnload = nullptr;
@@ -45,7 +47,7 @@ inline lv_obj_t* editKeyMatrix = nullptr;
 inline float binWeights[BIN_COUNT] = {45.0f, 30.0f, 50.0f, 20.0f, 60.0f, 35.0f};
 inline uint8_t localBin = 0;           // 本机仓号 0-5 (默认仓1)
 inline float simCurrentWeight = 25.3f;
-inline bool online = false;            // 模拟在线状态 (长按logo切换)
+inline bool online = true;            // 在线状态 (M1默认在线, 后续接ESP-NOW/蓝牙心跳更新)
 inline bool persistentError = false;
 inline uint32_t normalMessageUntil = 0;
 inline uint32_t lastSimUpdate = 0;
@@ -106,6 +108,10 @@ inline void updateConnLamp();
 inline void openEditPanel();
 inline void updateWeights();
 inline void showMessage(const char* text, bool error, bool persistent);
+inline void closeModal();
+inline void modalCloseEvent(lv_event_t* e);
+inline void updateBinDots();
+inline void showDevBinDialog();
 
 // ===== 消息栏 =====
 inline void showMessage(const char* text, bool error = false, bool persistent = false) {
@@ -466,17 +472,74 @@ inline void buttonEvent(lv_event_t* e) {
 }
 
 // ===== 长按logo: 切换在线/离线 (M1模拟) =====
+// ===== 长按logo: 开发者模式 - 编辑本机仓号 =====
+inline void devBinSelectEvent(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    localBin = idx;
+    Serial.printf("[EVENT] 开发者模式: 本机仓号设为 仓%d\n", idx + 1);
+    closeModal();
+    // 更新顶栏仓号文字
+    char binTitle[8];
+    snprintf(binTitle, sizeof(binTitle), "仓%d", localBin + 1);
+    lv_label_set_text(binLabel, binTitle);
+    updateBinDots();
+    updateWeights();
+    showMessage("已设为仓", false, false);
+}
+
+inline void showDevBinDialog() {
+    closeModal();
+    modal = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(modal);
+    lv_obj_set_size(modal, SCREEN_WIDTH, SCREEN_HEIGHT);
+    lv_obj_set_style_bg_color(modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(modal, LV_OPA_50, 0);
+    lv_obj_add_event_cb(modal, modalCloseEvent, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t* box = lv_obj_create(modal);
+    lv_obj_set_size(box, 360, 230);
+    lv_obj_center(box);
+    lv_obj_set_style_radius(box, 12, 0);
+    lv_obj_set_style_bg_color(box, C(CLR_PANEL), 0);
+    lv_obj_set_style_border_width(box, 3, 0);
+    lv_obj_set_style_border_color(box, C(CLR_ROASTEK), 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* titleLabel = makeLabel(box, "开发者:选择本机仓号", &lv_font_chinese_14, C(CLR_ROASTEK));
+    lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, 12);
+
+    // 6个仓按钮 2行3列
+    lv_obj_t* grid = lv_obj_create(box);
+    lv_obj_remove_style_all(grid);
+    lv_obj_set_size(grid, 330, 130);
+    lv_obj_align(grid, LV_ALIGN_TOP_MID, 0, 44);
+    lv_obj_set_style_pad_all(grid, 4, 0);
+    lv_obj_set_style_pad_row(grid, 6, 0);
+    lv_obj_set_style_pad_column(grid, 8, 0);
+    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    for (int i = 0; i < BIN_COUNT; ++i) {
+        lv_obj_t* b = lv_btn_create(grid);
+        lv_obj_set_size(b, 96, 48);
+        lv_obj_set_style_radius(b, 6, 0);
+        lv_obj_set_style_bg_color(b, C(i == localBin ? CLR_ROASTEK : 0xEEEEEE), 0);
+        lv_obj_set_style_border_width(b, 0, 0);
+        lv_obj_set_style_shadow_width(b, 0, 0);
+        lv_obj_add_event_cb(b, devBinSelectEvent, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        char bn[8];
+        snprintf(bn, sizeof(bn), "仓%d", i + 1);
+        lv_obj_t* bl = makeLabel(b, bn, &lv_font_chinese_14,
+                                  C(i == localBin ? 0xFFFFFF : CLR_TEXT));
+        lv_obj_center(bl);
+    }
+}
+
 inline void logoEvent(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
-    online = !online;
-    if (online) {
-        Serial.println("[EVENT] 长按logo: 切换在线");
-        showMessage("仓1 在线", false, false);
-    } else {
-        Serial.println("[EVENT] 长按logo: 切换离线");
-        showMessage("仓1 离线", true, true);
-    }
-    updateConnLamp();
+    Serial.println("[EVENT] 长按logo: 进入开发者模式(选择本机仓号)");
+    showDevBinDialog();
 }
 
 // ===== 触摸 =====
@@ -520,8 +583,12 @@ inline void displayFlush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t*
 // ===== 更新重量显示 =====
 inline void updateWeights() {
     char buf[32];
+    // 仓重大数字
     snprintf(buf, sizeof(buf), "%.1f", binWeights[localBin]);
     lv_label_set_text(binWeightLabel, buf);
+    // 称重重量(左1/4)
+    snprintf(buf, sizeof(buf), "%.1f", simCurrentWeight);
+    lv_label_set_text(curWeightLabel, buf);
 }
 
 // ===== 更新在线/离线灯 =====
@@ -614,7 +681,8 @@ inline void buildHome() {
     lv_obj_align(btnEdit, LV_ALIGN_RIGHT_MID, -8, 0);
     lv_obj_add_event_cb(btnEdit, buttonEvent, LV_EVENT_CLICKED, const_cast<char*>("edit"));
 
-    // --- 中间区 (130px大数字 + kg) ---
+    // --- 中间区: 左1/4称重重量 + 右3/4仓重大数字 ---
+    // 屏幕480宽: 左边120 (1/4), 右边360 (3/4)
     lv_obj_t* middle = lv_obj_create(root);
     lv_obj_remove_style_all(middle);
     lv_obj_set_size(middle, SCREEN_WIDTH, 190);
@@ -623,12 +691,22 @@ inline void buildHome() {
     lv_obj_set_style_bg_opa(middle, LV_OPA_COVER, 0);
     lv_obj_clear_flag(middle, LV_OBJ_FLAG_SCROLLABLE);
 
-    binWeightLabel = makeLabel(middle, "--", &lv_font_numbers_130, C(CLR_TEXT));
-    lv_obj_align(binWeightLabel, LV_ALIGN_LEFT_MID, 40, 0);
+    // === 左侧: 称重重量 (占1/4, 宽120) ===
+    // 称重数字用中等字体(montserrat_48), kg在下方缩小(montserrat_24)
+    curWeightLabel = makeLabel(middle, "--", &lv_font_montserrat_48, C(CLR_TEXT));
+    lv_obj_align(curWeightLabel, LV_ALIGN_TOP_LEFT, 8, 50);
 
-    kgLabel = makeLabel(middle, "kg", &lv_font_montserrat_48, C(CLR_TEXT));
-    // kg放在大数字右下, 用绝对坐标避免bbox穿模
-    lv_obj_align(kgLabel, LV_ALIGN_LEFT_MID, 40 + 260, 28);
+    curKgLabel = makeLabel(middle, "kg", &lv_font_montserrat_24, C(CLR_MUTED));
+    lv_obj_align_to(curKgLabel, curWeightLabel, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
+
+    // === 右侧: 仓重大数字 (占3/4, 从x=120开始) ===
+    // 130px大数字,kg在下方缩小(montserrat_24)
+    binWeightLabel = makeLabel(middle, "--", &lv_font_numbers_130, C(CLR_TEXT));
+    lv_obj_align(binWeightLabel, LV_ALIGN_TOP_LEFT, 135, 10);
+
+    kgLabel = makeLabel(middle, "kg", &lv_font_montserrat_24, C(CLR_MUTED));
+    // kg在大数字下方居中(大数字宽约260,放在数字右下避免穿模)
+    lv_obj_align(kgLabel, LV_ALIGN_TOP_LEFT, 135 + 200, 120);
 
     // --- 底部 (沿用老版本: 消息区在上 + 上料/下料两个大按钮在下) ---
     lv_obj_t* bottom = lv_obj_create(root);
