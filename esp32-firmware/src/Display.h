@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "Config.h"
+#include "EspnowMesh.h"
 
 extern "C" const lv_font_t lv_font_chinese_14;
 extern "C" const lv_font_t lv_font_numbers_130;
@@ -14,7 +15,7 @@ LV_IMG_DECLARE(logo_roastek);
 
 inline TFT_eSPI tft = TFT_eSPI();
 inline lv_disp_draw_buf_t drawBuf;
-inline lv_color_t lvBuf1[SCREEN_WIDTH * 40];
+inline lv_color_t lvBuf1[SCREEN_WIDTH * 20];
 inline lv_disp_drv_t dispDrv;
 inline lv_indev_drv_t indevDrv;
 
@@ -472,6 +473,8 @@ inline void devBinSelectEvent(lv_event_t* e) {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     localBin = idx;
     Serial.printf("[EVENT] 开发者模式: 本机仓号设为 仓%d\n", idx + 1);
+    // 同步到 ESP-NOW 组网
+    EspnowMesh_SetMyBin(idx + 1);
     closeModal();
     // 更新顶栏仓号文字
     char binTitle[8];
@@ -479,7 +482,6 @@ inline void devBinSelectEvent(lv_event_t* e) {
     lv_label_set_text(binLabel, binTitle);
     updateBinDots();
     updateWeights();
-    showMessage("已设为仓", false, false);
 }
 
 inline void showDevBinDialog() {
@@ -612,6 +614,21 @@ inline void updateConnLamp() {
     }
 }
 
+// ===== 外部访问接口 (供main调用) =====
+inline float Display_GetBinWeight() { return binWeights[localBin]; }
+inline float Display_GetCurrentWeight() { return simCurrentWeight; }
+
+// ESP-NOW 收到某仓状态变化 → 更新对应灯 + binOnline数组
+inline void Display_OnBinStateChange(uint8_t binId, bool online, float binWeight, float currentWeight) {
+    if (binId < 1 || binId > BIN_COUNT) return;
+    uint8_t idx = binId - 1;
+    binOnline[idx] = online;
+    // 同步该仓重量(便于编辑面板等其他用途)
+    if (idx != localBin) binWeights[idx] = binWeight;
+    Serial.printf("[Display] 仓%d %s (重量%.1f)\n", binId, online ? "上线" : "离线", binWeight);
+    updateBinDots();
+}
+
 // ===== 更新6仓状态灯 =====
 inline void updateBinDots() {
     for (uint8_t i = 0; i < BIN_COUNT; ++i) {
@@ -725,7 +742,8 @@ inline void buildHome() {
     // === 右侧: 仓重大数字 (占满右3/4, x=120..480) ===
     // 130px大数字,居中在右3/4区域; kg在下方缩小
     binWeightLabel = makeLabel(middle, "--", &lv_font_numbers_130, C(CLR_TEXT));
-    lv_obj_align(binWeightLabel, LV_ALIGN_TOP_MID, 60, 20);
+    // 仓重数字下移
+    lv_obj_align(binWeightLabel, LV_ALIGN_TOP_MID, 60, 28);
 
     kgLabel = makeLabel(middle, "kg", &lv_font_montserrat_24, C(CLR_MUTED));
     // kg在大数字下方居中
@@ -785,7 +803,7 @@ inline void Display_Init() {
     tft.setTouch(touchCalData);
 
     lv_init();
-    lv_disp_draw_buf_init(&drawBuf, lvBuf1, nullptr, SCREEN_WIDTH * 40);
+    lv_disp_draw_buf_init(&drawBuf, lvBuf1, nullptr, SCREEN_WIDTH * 20);
     lv_disp_drv_init(&dispDrv);
     dispDrv.hor_res = SCREEN_WIDTH;
     dispDrv.ver_res = SCREEN_HEIGHT;
