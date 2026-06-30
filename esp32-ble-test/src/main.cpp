@@ -39,7 +39,7 @@ static BLEUUID NOTIFY_UUID ("0000ffe2-0000-1000-8000-00805f9b34fb");
 // ---------- 读净重 Modbus-RTU 请求 ----------
 // 站号1, 功能码03, 起始地址0x0006, 数量2, CRC(低字节在前)
 static uint8_t MODBUS_REQ[] = {0x01, 0x03, 0x00, 0x06, 0x00, 0x02, 0x24, 0x0A};
-static const uint32_t READ_INTERVAL_MS = 500;   // 500ms 读一次
+static const uint32_t READ_INTERVAL_MS = 2000;  // 每2秒读一次
 static const uint32_t RESYNC_TIMEOUT_MS = 200;  // 200ms 没凑成帧就认为残包, 清缓冲重新累积
 
 // ---------- 状态 ----------
@@ -53,11 +53,27 @@ static bool connected = false;
 static uint8_t  rxbuf[32];
 static size_t   rxlen = 0;
 static uint32_t rxLastMs = 0;
+static portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t lastSendMs = 0;
 static uint32_t okCount = 0;
 static uint32_t errCount = 0;
 static uint32_t recvCount = 0;       // 收到 Notify 的次数
 static uint32_t sentSinceLastRecv = 0;
+
+static void clearRx() {
+    portENTER_CRITICAL(&rxMux);
+    rxlen = 0;
+    portEXIT_CRITICAL(&rxMux);
+}
+
+static size_t snapshotRx(uint8_t out[sizeof(rxbuf)], uint32_t* lastMs) {
+    portENTER_CRITICAL(&rxMux);
+    size_t len = rxlen;
+    memcpy(out, rxbuf, len);
+    *lastMs = rxLastMs;
+    portEXIT_CRITICAL(&rxMux);
+    return len;
+}
 
 // ---------- Modbus CRC16 ----------
 static uint16_t modbusCRC16(const uint8_t* data, size_t len) {
@@ -91,19 +107,25 @@ static float bytesToFloat(const uint8_t* p, bool swapWords) {
 // ---------- 尝试从缓冲解析一帧 Modbus 响应 ----------
 // 成功返回 true并把重量写入outNet
 static bool tryParseFrame(float* outNet, bool* outSwap) {
-    if (rxlen < 9) return false;
+    uint8_t localBuf[sizeof(rxbuf)];
+    size_t localLen;
+    portENTER_CRITICAL(&rxMux);
+    localLen = rxlen;
+    memcpy(localBuf, rxbuf, localLen);
+    portEXIT_CRITICAL(&rxMux);
+    if (localLen < 9) return false;
 
     // 找帧头: 01 03 04 (站号1 + 功能码3 + 字节数4)
     int start = -1;
-    for (size_t i = 0; i + 9 <= rxlen; ++i) {
-        if (rxbuf[i] == 0x01 && rxbuf[i+1] == 0x03 && rxbuf[i+2] == 0x04) {
+    for (size_t i = 0; i + 9 <= localLen; ++i) {
+        if (localBuf[i] == 0x01 && localBuf[i+1] == 0x03 && localBuf[i+2] == 0x04) {
             start = i;
             break;
         }
     }
     if (start < 0) return false;
 
-    const uint8_t* frame = &rxbuf[start];
+    const uint8_t* frame = &localBuf[start];
     // 验 CRC (前7字节: 站号+功能码+字节数+4字节float)
     uint16_t crcCalc = modbusCRC16(frame, 7);
     uint16_t crcRcvd = frame[7] | (frame[8] << 8);
@@ -132,10 +154,12 @@ static void notifyCallback(BLERemoteCharacteristic* c, uint8_t* data, size_t len
     recvCount++;
     sentSinceLastRecv = 0;
     // 追加到缓冲
+    portENTER_CRITICAL(&rxMux);
     for (size_t i = 0; i < len && rxlen < sizeof(rxbuf); ++i) {
         rxbuf[rxlen++] = data[i];
     }
     rxLastMs = millis();
+    portEXIT_CRITICAL(&rxMux);
 }
 
 // ---------- 连接 ----------
@@ -211,7 +235,7 @@ void loop() {
         connected = false;
         pWrite = pNotify = nullptr;
         pService = nullptr;
-        rxlen = 0;
+        clearRx();
         delay(2000);
         return;
     }
@@ -219,20 +243,25 @@ void loop() {
     uint32_t now = millis();
 
     // 2. 残包超时清缓冲 (避免上一帧没收齐污染下一帧)
-    if (rxlen > 0 && now - rxLastMs > RESYNC_TIMEOUT_MS) {
-        rxlen = 0;
+    uint8_t pending[sizeof(rxbuf)];
+    uint32_t pendingLastMs = 0;
+    size_t pendingLen = snapshotRx(pending, &pendingLastMs);
+    if (pendingLen > 0 && now - pendingLastMs > RESYNC_TIMEOUT_MS) {
+        clearRx();
+        pendingLen = 0;
     }
 
     // 3. 定时发请求
     if (now - lastSendMs >= READ_INTERVAL_MS) {
         lastSendMs = now;
         // 诊断: 发请求前缓冲里还剩多少 (上一轮没解析掉的字节)
-        if (rxlen > 0) {
-            Serial.printf("[DBG] 发新请求, 旧缓冲剩 %u 字节未解析: ", (unsigned)rxlen);
-            for (size_t i = 0; i < rxlen; i++) Serial.printf("%02X ", rxbuf[i]);
+        pendingLen = snapshotRx(pending, &pendingLastMs);
+        if (pendingLen > 0) {
+            Serial.printf("[DBG] 发新请求, 旧缓冲剩 %u 字节未解析: ", (unsigned)pendingLen);
+            for (size_t i = 0; i < pendingLen; i++) Serial.printf("%02X ", pending[i]);
             Serial.println();
         }
-        rxlen = 0;  // 发新请求前清缓冲, 只等本次响应
+        clearRx();  // 发新请求前清缓冲, 只等本次响应
         if (pWrite) {
             pWrite->writeValue(MODBUS_REQ, sizeof(MODBUS_REQ), false);
             sentSinceLastRecv++;
@@ -252,6 +281,6 @@ void loop() {
         // 这里先按 big-endian 显示, 如果你看 swap-word 那个数对,
         // 告诉我, 我把解析固定成 swap 字节序
         Serial.printf(">>> 净重 = %.3f kg  (OK=%u ERR=%u)\n", net, okCount, errCount);
-        rxlen = 0;
+        clearRx();
     }
 }

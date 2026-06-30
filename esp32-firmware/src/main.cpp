@@ -36,6 +36,11 @@ void setup() {
     const uint8_t localBinId = Display_GetLocalBinId();
     EspnowMesh_SetMyBin(localBinId);
     BleScale_SetMyBinId(localBinId);   // 让BLE任务知道本机仓号, 决定是否主动连模块
+
+    // 旧 Bluedroid 栈必须先于 WiFi/ESP-NOW 初始化，之后才能稳定执行 GATT connect。
+    // BLE任务有错峰延时，ESP-NOW会在它首次扫描前完成初始化。
+    BleScale_Init();
+
     EspnowMesh_SetGateway(DEFAULT_GATEWAY_FLAG);
     EspnowMesh_SetStateCallback(onBinStateChange);
     EspnowMesh_SetWeightSyncCallback(Display_OnBinWeightSync);
@@ -46,9 +51,6 @@ void setup() {
         // 上电后立即广播上线，不等待2秒心跳周期，避免其他仓不知道本机已恢复。
         EspnowMesh_AnnounceOnline(Display_GetBinWeight(), Display_GetCurrentWeight(), 5, 40);
     }
-
-    // 3. 蓝牙称重: 启用 BLE 读 A33E 净重
-    BleScale_Init();
 
     lastLvTick = millis();
 }

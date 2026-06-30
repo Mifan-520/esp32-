@@ -16,13 +16,16 @@
 // ============================================================
 
 #include <Arduino.h>
-#include <BLEDevice.h>
-#include <BLEClient.h>
-#include <BLEUtils.h>
-#include <BLEScan.h>
-#include <BLEAddress.h>
+#include <NimBLEDevice.h>
 #include "Config.h"
 #include "EspnowMesh.h"   // 查询远程BLE状态, 实现先到先得协调
+
+using BLEDevice = NimBLEDevice;
+using BLEClient = NimBLEClient;
+using BLEAddress = NimBLEAddress;
+using BLEUUID = NimBLEUUID;
+using BLERemoteService = NimBLERemoteService;
+using BLERemoteCharacteristic = NimBLERemoteCharacteristic;
 
 // ---------- 目标模块 (BLE) ----------
 #ifndef BLE_SCALE_DEVICE_NAME
@@ -42,11 +45,12 @@ static BLEUUID BLE_SCALE_NOTIFY_UUID ("0000ffe2-0000-1000-8000-00805f9b34fb");
 
 // ---------- 节奏 ----------
 #ifndef BLE_SCALE_READ_INTERVAL_MS
-#define BLE_SCALE_READ_INTERVAL_MS 500    // 500ms读一次，尽快建立/续租有效称重
+#define BLE_SCALE_READ_INTERVAL_MS 2000   // 每2秒读取一次A33E净重
 #endif
 #define BLE_SCALE_RESYNC_MS 400           // 残包超时
 #define BLE_SCALE_DATA_VALID_MS 5000      // 5秒内有读数视为有效
 #define BLE_SCALE_RETRY_DELAY_MS 1000     // 本机失败后的基础重试间隔
+#define BLE_SCALE_SCAN_SECONDS 2          // GAP异步扫描窗口，不阻塞任何业务循环
 
 // ---------- A33E Modbus-RTU ----------
 static const uint8_t  A33E_SLAVE_ID = 1;
@@ -66,6 +70,20 @@ static bool     btConnected = false;
 static bool     btLeaseActive = false;
 static uint32_t btConnectedAtMs = 0;
 static volatile uint32_t btNextAttemptMs = 0;
+
+enum BtAsyncScanState : uint8_t {
+    BT_SCAN_IDLE = 0,
+    BT_SCAN_RUNNING,
+    BT_SCAN_FOUND,
+    BT_SCAN_COMPLETE,
+    BT_SCAN_ERROR
+};
+static volatile BtAsyncScanState btScanState = BT_SCAN_IDLE;
+static uint8_t btTargetBda[6] = {0};
+static uint8_t btFoundBda[6] = {0};
+static volatile uint8_t btFoundAddrType = BLE_ADDR_PUBLIC;
+static portMUX_TYPE btScanMux = portMUX_INITIALIZER_UNLOCKED;
+
 
 // ---------- 与主循环共享的数据(原子读写, float/uint32 在 ESP32 上原子) ----------
 static volatile float    btCurrentWeight = 0.0f;
@@ -186,20 +204,67 @@ static void btNotifyCallback(BLERemoteCharacteristic* c, uint8_t* data, size_t l
 
 // ---------- 连接 ----------
 static bool btConnectByAddr(BLEAddress addr) {
-    if (!btClient) btClient = BLEDevice::createClient();
+    Serial.printf("[BleScale] 连接诊断: begin heap=%u max=%u\n",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    if (!btClient) {
+        btClient = BLEDevice::createClient();
+        btClient->setConnectTimeout(5);
+        Serial.printf("[BleScale] 连接诊断: client-created heap=%u max=%u\n",
+                      ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    }
+    Serial.println("[BleScale] 连接诊断: gatt-open...");
     bool ok = btClient->connect(addr);
+    Serial.printf("[BleScale] 连接诊断: gatt-open返回=%d\n", ok ? 1 : 0);
     if (!ok) { btConnected = false; return false; }
+    Serial.println("[BleScale] 连接诊断: get-service...");
     btService = btClient->getService(BLE_SCALE_SERVICE_UUID);
+    Serial.printf("[BleScale] 连接诊断: get-service返回=%d\n", btService ? 1 : 0);
     if (!btService) { btClient->disconnect(); btConnected = false; return false; }
+    Serial.println("[BleScale] 连接诊断: get-characteristics...");
     btWrite  = btService->getCharacteristic(BLE_SCALE_WRITE_UUID);
     btNotify = btService->getCharacteristic(BLE_SCALE_NOTIFY_UUID);
+    Serial.printf("[BleScale] 连接诊断: characteristics write=%d notify=%d\n",
+                  btWrite ? 1 : 0, btNotify ? 1 : 0);
     if (!btWrite || !btNotify) { btClient->disconnect(); btConnected = false; return false; }
-    if (btNotify->canNotify()) btNotify->registerForNotify(btNotifyCallback);
+    if (btNotify->canNotify()) btNotify->subscribe(true, btNotifyCallback, false);
     btConnected = true;
     btConnectedAtMs = millis();
     btLastRecvMs = 0;
     btClearRx();
     Serial.printf("[BleScale] ✅ 已连接 %s\n", BLE_SCALE_DEVICE_NAME);
+    return true;
+}
+
+// ---------- NimBLE异步扫描：低内存、带连接超时，不阻塞业务主循环 ----------
+class BtAdvertisedCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+    void onResult(NimBLEAdvertisedDevice* device) override {
+        NimBLEAddress address = device->getAddress();
+        if (memcmp(address.getNative(), btTargetBda, 6) == 0) {
+            portENTER_CRITICAL(&btScanMux);
+            memcpy(btFoundBda, address.getNative(), 6);
+            btFoundAddrType = address.getType();
+            btScanState = BT_SCAN_FOUND;
+            portEXIT_CRITICAL(&btScanMux);
+            NimBLEDevice::getScan()->stop();
+        }
+    }
+};
+static BtAdvertisedCallbacks btAdvertisedCallbacks;
+
+static void btScanCompleteCallback(NimBLEScanResults results) {
+    if (btScanState != BT_SCAN_FOUND) btScanState = BT_SCAN_COMPLETE;
+}
+
+static bool btStartAsyncScan() {
+    if (btScanState == BT_SCAN_RUNNING) return false;
+    btScanState = BT_SCAN_RUNNING;
+    bool ok = NimBLEDevice::getScan()->start(BLE_SCALE_SCAN_SECONDS, btScanCompleteCallback, false);
+    if (!ok) {
+        btScanState = BT_SCAN_ERROR;
+        Serial.println("[BleScale] 启动NimBLE异步扫描失败");
+        return false;
+    }
+    Serial.println("[BleScale] 异步扫描已启动，业务循环继续运行");
     return true;
 }
 
@@ -223,7 +288,7 @@ static uint32_t btElectionDelayMs() {
     if (binId < 1 || binId > BIN_COUNT) binId = BIN_COUNT;
     uint64_t chipId = ESP.getEfuseMac();
     uint32_t jitter = (uint32_t)(chipId ^ (chipId >> 32)) % 350U;
-    return 500U + (uint32_t)(binId - 1U) * 900U + jitter;
+    return 500U + (uint32_t)(binId - 1U) * 2000U + jitter;
 }
 
 // ============================================================
@@ -260,6 +325,36 @@ static void bleScaleTask(void* arg) {
 
         // 无远程租约时所有设备都参与；仓号+芯片ID错峰，先成功者用心跳阻止后续抢连。
         if (!btConnected) {
+            if (btScanState == BT_SCAN_FOUND) {
+                uint8_t addrBytes[6];
+                esp_ble_addr_type_t addrType;
+                portENTER_CRITICAL(&btScanMux);
+                memcpy(addrBytes, btFoundBda, 6);
+                addrType = btFoundAddrType;
+                btScanState = BT_SCAN_IDLE;
+                portEXIT_CRITICAL(&btScanMux);
+                Serial.printf("[BleScale] 已发现目标，BLE专用任务连接 type=%d\n", (int)addrType);
+                BLEAddress addr(addrBytes);
+                bool ok = btConnectByAddr(addr, addrType);
+                if (ok && btConnected) {
+                    lastSend = 0;
+                    Serial.println("[BleScale] GATT已连接，等待首个有效净重后再广播占用");
+                } else {
+                    btNextAttemptMs = millis() + BLE_SCALE_RETRY_DELAY_MS + btElectionDelayMs();
+                    Serial.println("[BleScale] 连接失败，进入错峰重试");
+                }
+                continue;
+            }
+            if (btScanState == BT_SCAN_COMPLETE || btScanState == BT_SCAN_ERROR) {
+                Serial.println(btScanState == BT_SCAN_COMPLETE ?
+                    "[BleScale] 本轮未发现目标，进入错峰重试" :
+                    "[BleScale] 异步扫描异常，进入错峰重试");
+                btScanState = BT_SCAN_IDLE;
+                btNextAttemptMs = now + BLE_SCALE_RETRY_DELAY_MS + btElectionDelayMs();
+                continue;
+            }
+            if (btScanState == BT_SCAN_SETTING_PARAMS || btScanState == BT_SCAN_RUNNING ||
+                btScanState == BT_SCAN_FOUND_STOPPING) continue;
             if (btNextAttemptMs == 0) {
                 uint32_t delayMs = btElectionDelayMs();
                 btNextAttemptMs = now + delayMs;
@@ -267,17 +362,12 @@ static void bleScaleTask(void* arg) {
             }
             if ((int32_t)(now - btNextAttemptMs) < 0) continue;
             btNextAttemptMs = 0;
-            Serial.println("[BleScale] 尝试连接称重模块(MAC直连)...");
+            Serial.println("[BleScale] 开始非阻塞扫描称重模块...");
             btWrite = btNotify = nullptr;
             btService = nullptr;
             btClearRx();
-            btConnectByAddr(BLEAddress(BLE_SCALE_DEVICE_MAC));
-            if (btConnected) {
-                lastSend = 0;
-                Serial.println("[BleScale] GATT已连接，等待首个有效净重后再广播占用");
-            } else {
+            if (!btStartAsyncScan()) {
                 btNextAttemptMs = millis() + BLE_SCALE_RETRY_DELAY_MS + btElectionDelayMs();
-                Serial.println("[BleScale] 连接失败，进入错峰重试");
             }
             continue;
         }
@@ -334,6 +424,19 @@ inline void BleScale_Init() {
     Serial.printf("[BleScale] 启动 BLE 任务, 目标: %s [%s]\n",
                   BLE_SCALE_DEVICE_NAME, BLE_SCALE_DEVICE_MAC);
     BLEDevice::init("A33E-Reader");
+    unsigned int mac[6] = {0};
+    if (sscanf(BLE_SCALE_DEVICE_MAC, "%02x:%02x:%02x:%02x:%02x:%02x",
+               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+        for (int i = 0; i < 6; ++i) btTargetBda[i] = (uint8_t)mac[i];
+    }
+    memset(&btScanParams, 0, sizeof(btScanParams));
+    btScanParams.scan_type = BLE_SCAN_TYPE_ACTIVE;
+    btScanParams.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+    btScanParams.scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL;
+    btScanParams.scan_interval = 0x50;
+    btScanParams.scan_window = 0x30;
+    btScanParams.scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE;
+    BLEDevice::setCustomGapHandler(btGapEventHandler);
     // 独立任务, 栈8K(BLE需要大栈), 固定到核心1(让核心0跑WiFi/ESP-NOW)
     xTaskCreatePinnedToCore(bleScaleTask, "bleScale", 8192, nullptr, 1, nullptr, 1);
 }
