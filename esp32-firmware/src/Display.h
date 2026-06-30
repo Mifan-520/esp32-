@@ -653,8 +653,6 @@ inline void showDevBinDialog() {
         lv_obj_center(bl);
     }
 
-    lv_obj_t* note = makeLabel(box, "修改后设备自动重启；只有主机占用蓝牙内存", &lv_font_chinese_14, C(CLR_MUTED));
-    lv_obj_align(note, LV_ALIGN_BOTTOM_MID, 0, -14);
 }
 
 inline void logoEvent(lv_event_t* e) {
