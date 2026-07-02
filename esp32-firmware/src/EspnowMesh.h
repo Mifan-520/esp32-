@@ -22,7 +22,7 @@ static constexpr uint32_t MASTER_WEIGHT_MAGIC = 0xA33E1001;
 static constexpr uint32_t FOLLOWER_ACK_MAGIC = 0xA33E1002;
 static constexpr uint32_t MASTER_SELECT_MAGIC = 0xA33E1003;
 static constexpr uint32_t BIN_EVENT_MAGIC = 0xA33E2001;
-static constexpr uint8_t ESPNOW_PROTOCOL_VERSION = 2;
+static constexpr uint8_t ESPNOW_PROTOCOL_VERSION = 3;
 
 // 事件类型枚举
 enum BinEventType : uint8_t {
@@ -63,6 +63,7 @@ struct BinEventPacket {
     uint8_t reporterBin;   // 实际广播的仓号 1-6
     float deltaG;          // load+ / unload- / 其它=0
     float newValue;        // edit=新仓重 / 其它=0
+    float binWeight;       // 事件完成后来源仓的本机仓重
     uint32_t seq;          // 每源仓递增, 供云端去重排序
 };
 
@@ -187,7 +188,8 @@ inline uint8_t EspnowMesh_BuildOnlineMask(uint32_t now) {
     return mask;
 }
 
-inline void EspnowMesh_BroadcastBinEvent(uint8_t eventType, float deltaG, float newValue, uint8_t sourceBin);
+inline void EspnowMesh_BroadcastBinEvent(uint8_t eventType, float deltaG, float newValue,
+                                         uint8_t sourceBin, float binWeight);
 
 inline void EspnowMesh_ApplyOnlineMask(uint8_t mask, float currentWeight) {
     bool isMaster = EspnowMesh_IsMaster();
@@ -202,7 +204,8 @@ inline void EspnowMesh_ApplyOnlineMask(uint8_t mask, float currentWeight) {
         // 主机统一在位图变化时广播 online/offline 事件, 供仓1(DTU节点)上报。
         if (changed && isMaster && meshInitialized && (i + 1) != myBinId) {
             EspnowMesh_BroadcastBinEvent(next ? BIN_EVENT_ONLINE : BIN_EVENT_OFFLINE,
-                                         0.0f, 0.0f, static_cast<uint8_t>(i + 1));
+                                         0.0f, 0.0f, static_cast<uint8_t>(i + 1),
+                                         binStates[i].binWeight);
         }
     }
     lastOnlineMask = mask;
@@ -242,7 +245,8 @@ inline void EspnowMesh_AnnounceOnline(float binWeight, float currentWeight, uint
 // 广播一个仓变化事件(load/unload/edit/online/offline)。
 // 本机广播后立即本地回调一次, 确保仓1(DTU节点)是事件源时也能上报自己的事件
 // (ESP-NOW 会过滤自己 MAC 的包)。
-inline void EspnowMesh_BroadcastBinEvent(uint8_t eventType, float deltaG, float newValue, uint8_t sourceBin) {
+inline void EspnowMesh_BroadcastBinEvent(uint8_t eventType, float deltaG, float newValue,
+                                         uint8_t sourceBin, float binWeight) {
     if (!meshInitialized || sourceBin < 1 || sourceBin > BIN_COUNT) return;
     BinEventPacket pkt{};
     pkt.magic = BIN_EVENT_MAGIC;
@@ -252,13 +256,14 @@ inline void EspnowMesh_BroadcastBinEvent(uint8_t eventType, float deltaG, float 
     pkt.reporterBin = myBinId;
     pkt.deltaG = deltaG;
     pkt.newValue = newValue;
+    pkt.binWeight = binWeight;
     pkt.seq = ++eventSeqPerBin[sourceBin - 1];
     esp_now_send(ESPNOW_BROADCAST_MAC, reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
     // 本机直接回调: 仓1作为DTU节点时会由此上报自己的事件; 主机自己产生的事件也走这条。
     if (gOnBinEventCb) gOnBinEventCb(pkt);
     if (eventType == BIN_EVENT_LOAD || eventType == BIN_EVENT_UNLOAD || eventType == BIN_EVENT_EDIT) {
-        Serial.printf("[ESPNOW] 事件广播: type=%u 仓%d delta=%.2f newVal=%.2f seq=%u\n",
-                      eventType, sourceBin, deltaG, newValue, pkt.seq);
+        Serial.printf("[ESPNOW] 事件广播: type=%u 仓%d delta=%.2f newVal=%.2f binWeight=%.2f seq=%u\n",
+                      eventType, sourceBin, deltaG, newValue, binWeight, pkt.seq);
     } else {
         Serial.printf("[ESPNOW] 事件广播: type=%u 仓%d seq=%u\n", eventType, sourceBin, pkt.seq);
     }

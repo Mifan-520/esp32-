@@ -27,7 +27,7 @@ static constexpr uint8_t FIXED_GATEWAY_ID = 1;
 // 命名从 ESP32 视角: TX_PIN=ESP32实际做TX输出的脚(25), RX_PIN=ESP32实际做RX输入的脚(32)。
 static constexpr int DTU_TX_PIN = 25;   // ESP32 TX 输出脚
 static constexpr int DTU_RX_PIN = 32;   // ESP32 RX 输入脚(备用)
-static constexpr uint32_t DTU_BAUD_DEFAULT = 9600;
+static constexpr uint32_t DTU_BAUD_DEFAULT = 115200;
 
 static constexpr uint32_t MESSAGE_CLEAR_MS = 5000;
 static constexpr uint32_t UI_TICK_MS = 5;
@@ -44,4 +44,7 @@ static constexpr uint32_t COLOR_TEXT = 0x222222;
 static constexpr uint32_t COLOR_MUTED = 0x888888;
 static constexpr uint32_t COLOR_ONLINE = 0x66FF66;
 static constexpr uint32_t COLOR_ERROR = 0xCC0000;
+
+// 编辑仓重前的密码保护
+static const char* const EDIT_PASSWORD = "123321";
 

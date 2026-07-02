@@ -15,14 +15,12 @@ void onBinStateChange(uint8_t binId, bool online, float binWeight, float current
     Display_OnBinStateChange(binId, online, binWeight, currentWeight);
 }
 
-// 事件类型 → 字符串名
+// 事件类型 → 字符串名（仅业务事件上报服务器，online/offline 由 DTU 心跳维持）
 static const char* eventTypeName(uint8_t t) {
     switch (t) {
         case BIN_EVENT_LOAD:    return "load";
         case BIN_EVENT_UNLOAD:  return "unload";
         case BIN_EVENT_EDIT:    return "edit";
-        case BIN_EVENT_ONLINE:  return "online";
-        case BIN_EVENT_OFFLINE: return "offline";
         default:                return "unknown";
     }
 }
@@ -31,15 +29,18 @@ static const char* eventTypeName(uint8_t t) {
 // DTU身份与仓号/主从完全解耦, 物理接DTU串口的那台勾开即可。
 void onBinEvent(const BinEventPacket& p) {
     if (!Display_IsDtuEnabled()) return;  // 非DTU节点不负责上报
-    char dBuf[16], nBuf[16];
+    // online/offline 是 ESP-NOW mesh 内部状态，不上报服务器
+    if (p.eventType == BIN_EVENT_ONLINE || p.eventType == BIN_EVENT_OFFLINE) return;
+    char dBuf[16], nBuf[16], bBuf[16];
     dtostrf(p.deltaG, 0, 2, dBuf);
     dtostrf(p.newValue, 0, 2, nBuf);
-    char json[128];
+    dtostrf(p.binWeight, 0, 2, bBuf);
+    char json[160];
     snprintf(json, sizeof(json),
              "{\"reporterBin\":%u,\"sourceBin\":%u,\"eventType\":\"%s\","
-             "\"deltaG\":%s,\"newValue\":%s,\"seq\":%lu}",
+             "\"deltaG\":%s,\"newValue\":%s,\"binWeight\":%s,\"seq\":%lu}",
              p.reporterBin, p.sourceBin, eventTypeName(p.eventType),
-             dBuf, nBuf, (unsigned long)p.seq);
+             dBuf, nBuf, bBuf, (unsigned long)p.seq);
     CloudReport_SendEventJson(json);
     Serial.printf("[DTU] 上报: %s\n", json);
 }

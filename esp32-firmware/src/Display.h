@@ -46,6 +46,12 @@ inline lv_obj_t* editKeyMatrix = nullptr;
 inline lv_obj_t* editConfirmBox = nullptr;   // 确认修改对话框
 inline float editPendingWeight = 0;           // 待确认的新重量
 
+// ===== 密码面板对象 =====
+inline lv_obj_t* pwdOverlay = nullptr;
+inline char pwdInputBuf[16] = "";
+inline lv_obj_t* pwdInputLabel = nullptr;
+inline lv_obj_t* pwdKeyMatrix = nullptr;
+
 // ===== 业务状态 (M1模拟) =====
 inline float binWeights[BIN_COUNT] = {45.0f, 30.0f, 50.0f, 20.0f, 60.0f, 35.0f};
 inline uint8_t localBin = 0;           // 本机仓号 0-5 (默认仓1)
@@ -168,6 +174,10 @@ inline void setOnline(bool isOnline);
 inline void showCommAlarm();
 inline void hideCommAlarm();
 inline void showEditConfirmDialog(float newWeight);
+inline void openPasswordPanel();
+inline void closePasswordPanel();
+inline void pwdKeyEvent(lv_event_t* e);
+inline void pwdConfirmEvent(lv_event_t* e);
 
 // ===== 消息栏 (已移除UI, 保留接口仅作日志/离线控制) =====
 inline void showMessage(const char* text, bool error = false, bool persistent = false) {
@@ -239,7 +249,8 @@ inline void confirmEvent(lv_event_t* e) {
         nvsSaveBinWeights();
         updateWeights();
         showMessage("上料完毕", false, false);
-        EspnowMesh_BroadcastBinEvent(BIN_EVENT_LOAD, simCurrentWeight, 0.0f, b + 1);
+        EspnowMesh_BroadcastBinEvent(BIN_EVENT_LOAD, simCurrentWeight, 0.0f,
+                                     b + 1, binWeights[b]);
     } else if (op && strcmp(op, "unload") == 0) {
         if (binWeights[b] < simCurrentWeight) {
             Serial.printf("[EVENT] 下料失败: 仓%d %.1f < 当前 %.1f\n", b + 1, binWeights[b], simCurrentWeight);
@@ -251,7 +262,8 @@ inline void confirmEvent(lv_event_t* e) {
             nvsSaveBinWeights();
             updateWeights();
             showMessage("下料完毕", false, false);
-            EspnowMesh_BroadcastBinEvent(BIN_EVENT_UNLOAD, -simCurrentWeight, 0.0f, b + 1);
+            EspnowMesh_BroadcastBinEvent(BIN_EVENT_UNLOAD, -simCurrentWeight, 0.0f,
+                                         b + 1, binWeights[b]);
         }
     }
     closeModal();
@@ -420,7 +432,8 @@ inline void showEditConfirmDialog(float newWeight) {
         // 立即广播本机仓更新(心跳)
         EspnowMesh_BroadcastHeartbeat(binWeights[localBin], simCurrentWeight);
         // 广播编辑事件(只报新值), 供仓1(DTU节点)上报
-        EspnowMesh_BroadcastBinEvent(BIN_EVENT_EDIT, 0.0f, val, localBin + 1);
+        EspnowMesh_BroadcastBinEvent(BIN_EVENT_EDIT, 0.0f, val,
+                                     localBin + 1, binWeights[localBin]);
         showMessage("修改完毕", false, false);
     }, LV_EVENT_CLICKED, nullptr);
 }
@@ -434,6 +447,104 @@ inline void editConfirmEvent(lv_event_t* e) {
     float val = atof(editInputBuf);
     // 弹出确认修改对话框
     showEditConfirmDialog(val);
+}
+
+// ===== 密码面板（编辑仓重前置验证）=====
+// 纯数字键盘map 4x3: 7 8 9 / 4 5 6 / 1 2 3 / ← 0 确认
+static const char* pwdKbMap[] = {
+    "7", "8", "9", "\n",
+    "4", "5", "6", "\n",
+    "1", "2", "3", "\n",
+    LV_SYMBOL_BACKSPACE, "0", "OK", ""
+};
+
+inline void closePasswordPanel() {
+    if (!pwdOverlay) return;
+    lv_obj_del(pwdOverlay);
+    pwdOverlay = nullptr;
+    pwdInputLabel = nullptr;
+    pwdKeyMatrix = nullptr;
+    memset(pwdInputBuf, 0, sizeof(pwdInputBuf));
+}
+
+inline void pwdKeyEvent(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    lv_obj_t* btnm = static_cast<lv_obj_t*>(lv_event_get_target(e));
+    uint16_t btnId = lv_btnmatrix_get_selected_btn(btnm);
+    const char* txt = lv_btnmatrix_get_btn_text(btnm, btnId);
+    if (!txt) return;
+
+    if (strcmp(txt, LV_SYMBOL_BACKSPACE) == 0) {
+        size_t len = strlen(pwdInputBuf);
+        if (len > 0) pwdInputBuf[len - 1] = '\0';
+    } else if (strcmp(txt, "OK") == 0) {
+        if (strcmp(pwdInputBuf, EDIT_PASSWORD) == 0) {
+            closePasswordPanel();
+            openEditPanel();
+        } else {
+            // 密码错误：清空输入，刷新显示
+            memset(pwdInputBuf, 0, sizeof(pwdInputBuf));
+            if (pwdInputLabel) lv_label_set_text(pwdInputLabel, "密码错误");
+        }
+        return;
+    } else {
+        // 数字键
+        size_t len = strlen(pwdInputBuf);
+        if (len < sizeof(pwdInputBuf) - 1) {
+            pwdInputBuf[len] = txt[0];
+            pwdInputBuf[len + 1] = '\0';
+        }
+    }
+
+    // 刷新显示：用圆点遮掩
+    if (pwdInputLabel) {
+        size_t len = strlen(pwdInputBuf);
+        char dots[16] = "";
+        for (size_t i = 0; i < len && i < 15; i++) dots[i] = '*';
+        dots[len] = '\0';
+        lv_label_set_text(pwdInputLabel, dots);
+    }
+}
+
+inline void openPasswordPanel() {
+    if (pwdOverlay) return;
+    memset(pwdInputBuf, 0, sizeof(pwdInputBuf));
+
+    pwdOverlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(pwdOverlay);
+    lv_obj_set_size(pwdOverlay, SCREEN_WIDTH, SCREEN_HEIGHT);
+    lv_obj_set_style_bg_color(pwdOverlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(pwdOverlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(pwdOverlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* box = lv_obj_create(pwdOverlay);
+    lv_obj_set_size(box, 340, 290);
+    lv_obj_center(box);
+    lv_obj_set_style_radius(box, 12, 0);
+    lv_obj_set_style_bg_color(box, C(CLR_PANEL), 0);
+    lv_obj_set_style_border_width(box, 3, 0);
+    lv_obj_set_style_border_color(box, C(CLR_ROASTEK), 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* titleLabel = makeLabel(box, "请输入密码", &lv_font_chinese_14, C(CLR_ROASTEK));
+    lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, 12);
+
+    pwdInputLabel = makeLabel(box, "", &lv_font_chinese_14, C(CLR_TEXT));
+    lv_obj_align(pwdInputLabel, LV_ALIGN_TOP_MID, 0, 40);
+
+    pwdKeyMatrix = lv_btnmatrix_create(box);
+    lv_obj_set_size(pwdKeyMatrix, 280, 160);
+    lv_obj_align(pwdKeyMatrix, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_btnmatrix_set_map(pwdKeyMatrix, pwdKbMap);
+    lv_obj_set_style_bg_color(pwdKeyMatrix, C(CLR_BG_INPUT), 0);
+    lv_obj_add_event_cb(pwdKeyMatrix, pwdKeyEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    // 点击空白处关闭
+    lv_obj_add_event_cb(pwdOverlay, [](lv_event_t* e) {
+        if (lv_event_get_target(e) == pwdOverlay) closePasswordPanel();
+    }, LV_EVENT_CLICKED, nullptr);
+
+    Serial.println("[EVENT] 密码面板已打开");
 }
 
 inline void openEditPanel() {
@@ -552,7 +663,7 @@ inline void buttonEvent(lv_event_t* e) {
     Serial.printf("[EVENT] 按钮点击: %s\n", action);
     if (strcmp(action, "load") == 0) showConfirmDialog("上料", "load");
     else if (strcmp(action, "unload") == 0) showConfirmDialog("下料", "unload");
-    else if (strcmp(action, "edit") == 0) openEditPanel();
+    else if (strcmp(action, "edit") == 0) openPasswordPanel();
 }
 
 // ===== 长按logo: 开发者模式 - 编辑本机仓号/指定唯一主机 =====
